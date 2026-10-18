@@ -5,8 +5,8 @@ const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
 // player settings
-const size = 36; // 36px feels a bit tighter than 40
-let gravity = 0.52; // tweak this if it feels too floaty or heavy
+const size = 36;
+let gravity = 1.3; // much faster, snappy turn between floor and ceiling
 
 let x = 100;
 let y = canvas.height - size;
@@ -16,7 +16,7 @@ let onSurface = true;
 // obstacle list & game state
 let obstacles = [];
 let timer = 0;
-let speed = 5;
+let speed = 5.2;
 let frames = 0;
 let shake = 0;
 let state = "start"; // start | play | pause | over
@@ -84,7 +84,7 @@ function resetGame() {
   onSurface = true;
   obstacles = [];
   timer = 0;
-  speed = 5;
+  speed = 5.2;
   score = 0;
   trail = [];
   particles = [];
@@ -100,6 +100,8 @@ function flipGravity() {
   if (state === "play" && onSurface) {
     gravity = -gravity;
     onSurface = false;
+    // quick launch boost so turning is fast and responsive
+    vy = gravity * 3.5;
     beep(480, 0.07, "triangle", 0.04);
   }
 }
@@ -123,7 +125,7 @@ document.addEventListener("keydown", function (e) {
   }
 });
 
-// also let player click canvas to flip because spacebar gets tiring
+// let player click canvas to flip too
 canvas.addEventListener("pointerdown", function (e) {
   e.preventDefault();
   flipGravity();
@@ -147,31 +149,21 @@ function hit(a, b) {
 }
 
 // ---------------- obstacle spawner ----------------
+// clean solid obstacles only - no up and down oscillating movers
 function spawn() {
   const roll = Math.random();
 
-  // moving block after reaching higher score
-  if (score > 750 && roll < 0.22) {
+  if (score > 250 && roll < 0.35) {
+    // static floating block in mid-air
     obstacles.push({
       x: canvas.width,
-      y: 150,
-      w: 26,
-      h: 65,
-      type: "mover",
-      base: 150,
-      phase: Math.random() * Math.PI * 2,
-    });
-  } else if (score > 250 && roll < 0.42) {
-    // floating block in mid-air
-    obstacles.push({
-      x: canvas.width,
-      y: 110 + Math.random() * 110,
+      y: 115 + Math.random() * 100,
       w: 26,
       h: 52,
       type: "floater",
     });
   } else {
-    // regular pillar on floor or ceiling
+    // clean solid pillar on floor or ceiling
     const h = 55 + Math.random() * 80;
     const onFloor = Math.random() < 0.5;
     obstacles.push({
@@ -186,7 +178,6 @@ function spawn() {
 
 function colorFor(o) {
   if (o.type === "floater") return "#f59e0b"; // warm amber
-  if (o.type === "mover") return "#a855f7";   // muted purple
   return "#f43f5e"; // clean coral red
 }
 
@@ -252,7 +243,7 @@ function loop() {
   if (state === "play") {
     frames = frames + 1;
 
-    // physics update
+    // physics update - fast, responsive gravity
     vy = vy + gravity;
     y = y + vy;
     onSurface = false;
@@ -271,22 +262,19 @@ function loop() {
     }
 
     score = score + 1;
-    speed = 5 + score / 1400; // gentle ramp up
+    speed = 5.2 + score / 1400; // gentle ramp up
     if (score % 500 === 0) beep(750, 0.1, "sine", 0.03);
 
     // spawn obstacles
     timer = timer + 1;
-    if (timer > Math.max(34, 75 - score / 60)) {
+    if (timer > Math.max(32, 70 - score / 60)) {
       spawn();
       timer = 0;
     }
 
-    // update obstacles
+    // update obstacles (all static now, no up/down animation)
     for (const o of obstacles) {
       o.x = o.x - speed;
-      if (o.type === "mover") {
-        o.y = o.base + Math.sin(frames / 24 + o.phase) * 90;
-      }
       if (hit({ x: x, y: y, w: size, h: size }, o)) {
         die();
       }
@@ -297,7 +285,7 @@ function loop() {
 
     // trail history
     trail.push({ x: x, y: y });
-    if (trail.length > 10) trail.shift();
+    if (trail.length > 8) trail.shift();
   }
 
   // draw obstacles (clean flat colors + subtle border)
@@ -317,15 +305,10 @@ function loop() {
   }
   ctx.globalAlpha = 1;
 
-  // draw player
+  // draw player (solid, clean square - no up and down turning animation)
   if (state !== "over") {
     ctx.fillStyle = "#38bdf8";
     ctx.fillRect(x, y, size, size);
-
-    // little eye/cockpit so the player isn't just a lifeless square
-    ctx.fillStyle = "#ffffff";
-    const eyeY = gravity > 0 ? y + 8 : y + size - 14;
-    ctx.fillRect(x + size - 11, eyeY, 5, 6);
   }
 
   // death particles
