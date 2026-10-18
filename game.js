@@ -4,19 +4,30 @@
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
-// player settings
+// player physics & settings
 const size = 36;
-let gravity = 1.3; // much faster, snappy turn between floor and ceiling
+let gravity = 1.35; // fast, snappy gravity flip
 
-let x = 100;
+let x = 110;
 let y = canvas.height - size;
 let vy = 0;
 let onSurface = true;
 
+// tactile squash & stretch for landing/jumping feel
+let scaleX = 1;
+let scaleY = 1;
+
+// input buffering - if player presses flip 140ms before landing, flip immediately on touchdown
+let flipBufferTimer = 0;
+const BUFFER_MS = 140;
+
 // obstacle list & game state
 let obstacles = [];
+let shards = [];      // collectible bonus shards
+let floaters = [];    // floating score popups ("+50", "Close Call!")
 let timer = 0;
-let speed = 5.2;
+let nextSpawnDistance = 60;
+let speed = 5.4;
 let frames = 0;
 let shake = 0;
 let state = "start"; // start | play | pause | over
@@ -24,93 +35,190 @@ let state = "start"; // start | play | pause | over
 // scoring
 let score = 0;
 let best = Number(localStorage.getItem("gdBest")) || 0;
-// let debugMode = false; // set to true if you wanna test without dying lol
+let newBestTriggered = false;
 
-// visual stuff
+// visual effects
 let trail = [];
 let particles = [];
 let stars = [];
+let railOffset = 0;
 
-// simple starfield so the void isn't completely empty
-for (let i = 0; i < 55; i++) {
+// distant stars for depth
+for (let i = 0; i < 60; i++) {
   stars.push({
     x: Math.random() * canvas.width,
     y: Math.random() * canvas.height,
-    s: 0.8 + Math.random() * 1.8,
+    s: 0.8 + Math.random() * 1.6,
+    speedFactor: 0.15 + Math.random() * 0.25
   });
 }
 
-// ---------------- sound effects ----------------
-// web audio context needs a click first or chrome complains in the console
+// ---------------- sound effects (procedural web audio) ----------------
 let audio = null;
 let muted = localStorage.getItem("gdMuted") === "1";
 
-function beep(freq, dur, type, vol) {
-  if (muted) return;
-  try {
-    if (!audio) {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      audio = new AudioContext();
-    }
-    if (audio.state === "suspended") {
-      audio.resume();
-    }
-    const o = audio.createOscillator();
-    const g = audio.createGain();
-    o.type = type || "square";
-    o.frequency.value = freq;
-    g.gain.value = vol || 0.04;
-    o.connect(g);
-    g.connect(audio.destination);
-    o.start();
-    g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
-    o.stop(audio.currentTime + dur);
-  } catch (err) {
-    // audio failed, ignore it so game doesn't crash
+function getAudio() {
+  if (!audio) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (AudioContext) audio = new AudioContext();
   }
+  if (audio && audio.state === "suspended") {
+    audio.resume();
+  }
+  return audio;
 }
 
-// handy helper, basically just Math.max/min
-function clamp(val, min, max) {
-  return Math.max(min, Math.min(max, val));
+function playSound(type) {
+  if (muted) return;
+  const actx = getAudio();
+  if (!actx) return;
+
+  const now = actx.currentTime;
+
+  if (type === "flip") {
+    // snappy woosh/click
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = "sine";
+    const startF = gravity > 0 ? 300 : 540;
+    const endF = gravity > 0 ? 540 : 300;
+    osc.frequency.setValueAtTime(startF, now);
+    osc.frequency.exponentialRampToValueAtTime(endF, now + 0.08);
+    gain.gain.setValueAtTime(0.08, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  } else if (type === "land") {
+    // subtle low thud
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(110, now);
+    osc.frequency.exponentialRampToValueAtTime(45, now + 0.06);
+    gain.gain.setValueAtTime(0.09, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.07);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start(now);
+    osc.stop(now + 0.07);
+  } else if (type === "collect") {
+    // bright 2-note chime
+    [660, 990].forEach((freq, i) => {
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, now + i * 0.04);
+      gain.gain.setValueAtTime(0.07, now + i * 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.04 + 0.09);
+      osc.connect(gain);
+      gain.connect(actx.destination);
+      osc.start(now + i * 0.04);
+      osc.stop(now + i * 0.04 + 0.1);
+    });
+  } else if (type === "crash") {
+    // low noise crunch
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(140, now);
+    osc.frequency.exponentialRampToValueAtTime(30, now + 0.28);
+    gain.gain.setValueAtTime(0.2, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start(now);
+    osc.stop(now + 0.29);
+  } else if (type === "start") {
+    const osc = actx.createOscillator();
+    const gain = actx.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(440, now);
+    osc.frequency.exponentialRampToValueAtTime(660, now + 0.1);
+    gain.gain.setValueAtTime(0.06, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.11);
+    osc.connect(gain);
+    gain.connect(actx.destination);
+    osc.start(now);
+    osc.stop(now + 0.12);
+  }
 }
 
 // ---------------- reset / start ----------------
 function resetGame() {
-  x = 100;
+  x = 110;
   y = canvas.height - size;
   vy = 0;
-  gravity = Math.abs(gravity); // always start falling down
+  gravity = Math.abs(gravity); // always start on floor
   onSurface = true;
+  scaleX = 1;
+  scaleY = 1;
+  flipBufferTimer = 0;
+
   obstacles = [];
+  shards = [];
+  floaters = [];
   timer = 0;
-  speed = 5.2;
+  nextSpawnDistance = 60;
+  speed = 5.4;
   score = 0;
+  newBestTriggered = false;
   trail = [];
   particles = [];
   state = "play";
-  beep(600, 0.09, "sine", 0.05);
+
+  playSound("start");
 }
 
-function flipGravity() {
+function doFlip() {
+  gravity = -gravity;
+  onSurface = false;
+
+  // snappy launch impulse
+  vy = gravity * 3.8;
+
+  // tactile launch stretch
+  scaleX = 0.82;
+  scaleY = 1.25;
+
+  playSound("flip");
+
+  // small burst of thruster dust at launch point
+  const dustY = gravity > 0 ? 4 : canvas.height - 4;
+  for (let i = 0; i < 5; i++) {
+    particles.push({
+      x: x + size / 2 + (Math.random() - 0.5) * 14,
+      y: dustY,
+      vx: -(Math.random() * 2 + 2),
+      vy: gravity > 0 ? Math.random() * 2 : -Math.random() * 2,
+      life: 14 + Math.random() * 8,
+      color: "#38bdf8",
+      size: 2.5
+    });
+  }
+}
+
+function requestFlip() {
   if (state === "start" || state === "over") {
     resetGame();
     return;
   }
-  if (state === "play" && onSurface) {
-    gravity = -gravity;
-    onSurface = false;
-    // quick launch boost so turning is fast and responsive
-    vy = gravity * 3.5;
-    beep(480, 0.07, "triangle", 0.04);
+  if (state === "play") {
+    if (onSurface) {
+      doFlip();
+    } else {
+      // buffer the flip if pressed slightly before landing
+      flipBufferTimer = Date.now();
+    }
   }
 }
 
 // ---------------- controls ----------------
 document.addEventListener("keydown", function (e) {
-  if (e.code === "Space" || e.code === "ArrowUp") {
+  if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") {
     e.preventDefault();
-    flipGravity();
+    requestFlip();
   }
   if (e.code === "KeyR" && state === "over") {
     resetGame();
@@ -125,21 +233,20 @@ document.addEventListener("keydown", function (e) {
   }
 });
 
-// let player click canvas to flip too
+// canvas touch / click support
 canvas.addEventListener("pointerdown", function (e) {
   e.preventDefault();
-  flipGravity();
+  requestFlip();
 });
 
-// pause automatically if player tabs away
+// pause when window loses focus
 window.addEventListener("blur", function () {
   if (state === "play") state = "pause";
 });
 
-// ---------------- collision ----------------
-// standard aabb box collision with tiny 2px padding for fairness
+// ---------------- collision & near-miss helper ----------------
 function hit(a, b) {
-  const pad = 2; // forgiving hitbox feels way more fun
+  const pad = 2; // forgiving hitbox
   return (
     a.x + pad < b.x + b.w &&
     a.x + a.w - pad > b.x &&
@@ -148,61 +255,137 @@ function hit(a, b) {
   );
 }
 
-// ---------------- obstacle spawner ----------------
-// clean solid obstacles only - no up and down oscillating movers
-function spawn() {
-  const roll = Math.random();
+function addFloater(text, fx, fy, color = "#f1f5f9") {
+  floaters.push({
+    text,
+    x: fx,
+    y: fy,
+    vy: -1.3,
+    life: 32,
+    color
+  });
+}
 
-  if (score > 250 && roll < 0.35) {
-    // static floating block in mid-air
+// ---------------- procedural obstacle & rhythm spawner ----------------
+function spawnPattern() {
+  const roll = Math.random();
+  const spawnX = canvas.width + 20;
+
+  // Pattern A: Mid-air static gate (safe on floor or ceiling)
+  if (score > 300 && roll < 0.28) {
+    const midY = (canvas.height - 60) / 2;
     obstacles.push({
-      x: canvas.width,
-      y: 115 + Math.random() * 100,
+      x: spawnX,
+      y: midY,
       w: 26,
-      h: 52,
-      type: "floater",
+      h: 60,
+      type: "gate",
+      nearMissed: false
     });
-  } else {
-    // clean solid pillar on floor or ceiling
-    const h = 55 + Math.random() * 80;
-    const onFloor = Math.random() < 0.5;
+    // spawn bonus shard above or below
+    const shardOnTop = Math.random() < 0.5;
+    shards.push({
+      x: spawnX + 13,
+      y: shardOnTop ? midY - 32 : midY + 60 + 32,
+      size: 11
+    });
+    nextSpawnDistance = 65 + Math.random() * 20;
+    return;
+  }
+
+  // Pattern B: Alternating rhythm pair (Floor spike -> Ceiling spike)
+  if (score > 500 && roll < 0.52) {
+    const h1 = 55;
+    const h2 = 55;
     obstacles.push({
-      x: canvas.width,
-      y: onFloor ? canvas.height - h : 0,
-      w: 28,
-      h: h,
+      x: spawnX,
+      y: canvas.height - h1,
+      w: 26,
+      h: h1,
       type: "block",
+      nearMissed: false
+    });
+    const gap = 120 + speed * 6;
+    obstacles.push({
+      x: spawnX + gap,
+      y: 0,
+      w: 26,
+      h: h2,
+      type: "block",
+      nearMissed: false
+    });
+    shards.push({
+      x: spawnX + gap / 2,
+      y: canvas.height / 2,
+      size: 11
+    });
+    nextSpawnDistance = (gap + 75) / (speed * 0.8);
+    return;
+  }
+
+  // Pattern C: Standard solid pillar on floor or ceiling
+  const onFloor = Math.random() < 0.5;
+  const h = 58 + Math.random() * 85;
+  obstacles.push({
+    x: spawnX,
+    y: onFloor ? canvas.height - h : 0,
+    w: 26,
+    h: h,
+    type: "block",
+    nearMissed: false
+  });
+
+  // 35% chance to place a rewarding collectible shard near the opposite surface
+  if (Math.random() < 0.35) {
+    shards.push({
+      x: spawnX + 13,
+      y: onFloor ? 65 : canvas.height - 65,
+      size: 11
+    });
+  }
+
+  nextSpawnDistance = 55 + Math.random() * 25;
+}
+
+// ---------------- landing dust & crash particles ----------------
+function spawnLandingDust(isCeiling) {
+  const dustY = isCeiling ? 2 : canvas.height - 2;
+  for (let i = 0; i < 7; i++) {
+    particles.push({
+      x: x + size / 2 + (Math.random() - 0.5) * 18,
+      y: dustY,
+      vx: (Math.random() - 0.5) * 3.5 - 1.5,
+      vy: isCeiling ? Math.random() * 2.5 : -Math.random() * 2.5,
+      life: 14 + Math.random() * 8,
+      color: "#94a3b8",
+      size: 2
     });
   }
 }
 
-function colorFor(o) {
-  if (o.type === "floater") return "#f59e0b"; // warm amber
-  return "#f43f5e"; // clean coral red
-}
-
-// ---------------- particles & game over ----------------
 function burst(px, py) {
-  for (let i = 0; i < 28; i++) {
+  // shatter burst on death
+  for (let i = 0; i < 34; i++) {
     const angle = Math.random() * Math.PI * 2;
-    const power = 1.5 + Math.random() * 4.5;
+    const power = 1.5 + Math.random() * 5.5;
     particles.push({
       x: px,
       y: py,
       vx: Math.cos(angle) * power,
       vy: Math.sin(angle) * power,
-      life: 35 + Math.random() * 20,
+      life: 35 + Math.random() * 25,
+      color: Math.random() > 0.4 ? "#38bdf8" : "#f43f5e",
+      size: 3.5
     });
   }
 }
 
 function die() {
   state = "over";
-  shake = 12;
+  shake = 14;
   burst(x + size / 2, y + size / 2);
-  beep(110, 0.35, "sawtooth", 0.08);
+  playSound("crash");
 
-  // console.log("died with score:", Math.floor(score / 10));
   if (score > best) {
     best = score;
     localStorage.setItem("gdBest", best);
@@ -220,17 +403,20 @@ function loop() {
     shake = shake - 1;
   }
 
-  // parallax stars
+  // 1. Background stars parallax
   ctx.fillStyle = "#ffffff";
   for (const st of stars) {
-    st.x = st.x - st.s * (state === "play" ? speed / 6 : 0.25);
+    st.x = st.x - st.speedFactor * (state === "play" ? speed : 0.6);
     if (st.x < 0) st.x = canvas.width;
-    ctx.globalAlpha = 0.2 + st.s * 0.25;
+    ctx.globalAlpha = 0.2 + st.speedFactor * 0.35;
     ctx.fillRect(st.x, st.y, st.s, st.s);
   }
   ctx.globalAlpha = 1;
 
-  // floor and ceiling boundaries
+  // 2. Parallax rails with moving speed hashes
+  railOffset = (railOffset + (state === "play" ? speed : 0.6)) % 40;
+
+  // Floor and ceiling main lines
   ctx.strokeStyle = "#252836";
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -240,105 +426,244 @@ function loop() {
   ctx.lineTo(canvas.width, canvas.height - 1);
   ctx.stroke();
 
+  // Moving tick hashes on rails to give a real sense of speed
+  ctx.fillStyle = "#1e2230";
+  for (let rx = -railOffset; rx < canvas.width + 40; rx += 40) {
+    ctx.fillRect(rx, 0, 14, 3);
+    ctx.fillRect(rx, canvas.height - 3, 14, 3);
+  }
+
+  // 3. Gameplay logic updates
   if (state === "play") {
     frames = frames + 1;
 
-    // physics update - fast, responsive gravity
+    // vertical physics
     vy = vy + gravity;
     y = y + vy;
     onSurface = false;
 
     // hit the floor
     if (y > canvas.height - size) {
+      if (!onSurface && vy > 1) {
+        playSound("land");
+        spawnLandingDust(false);
+        scaleX = 1.25;
+        scaleY = 0.78; // landing squash
+      }
       y = canvas.height - size;
       vy = 0;
       onSurface = true;
+
+      // check if a buffered flip was waiting for floor contact
+      if (Date.now() - flipBufferTimer < BUFFER_MS) {
+        flipBufferTimer = 0;
+        doFlip();
+      }
     }
+
     // hit the ceiling
     if (y < 0) {
+      if (!onSurface && vy < -1) {
+        playSound("land");
+        spawnLandingDust(true);
+        scaleX = 1.25;
+        scaleY = 0.78; // landing squash
+      }
       y = 0;
       vy = 0;
       onSurface = true;
+
+      // check if a buffered flip was waiting for ceiling contact
+      if (Date.now() - flipBufferTimer < BUFFER_MS) {
+        flipBufferTimer = 0;
+        doFlip();
+      }
     }
 
-    score = score + 1;
-    speed = 5.2 + score / 1400; // gentle ramp up
-    if (score % 500 === 0) beep(750, 0.1, "sine", 0.03);
+    // spring physics recovery for squash & stretch
+    scaleX += (1 - scaleX) * 0.22;
+    scaleY += (1 - scaleY) * 0.22;
 
-    // spawn obstacles
+    // score & speed scaling
+    score = score + 1;
+    speed = 5.4 + Math.min(score / 1200, 7.0);
+
+    // new best celebration sound
+    if (score > best && best > 0 && !newBestTriggered) {
+      newBestTriggered = true;
+      addFloater("NEW BEST!", canvas.width / 2, 70, "#f59e0b");
+      playSound("collect");
+    }
+
+    // spawn obstacles with rhythm timing
     timer = timer + 1;
-    if (timer > Math.max(32, 70 - score / 60)) {
-      spawn();
+    if (timer > nextSpawnDistance) {
+      spawnPattern();
       timer = 0;
     }
 
-    // update obstacles (all static now, no up/down animation)
+    // update obstacles & check collisions / near misses
+    const pBox = { x: x, y: y, w: size, h: size };
     for (const o of obstacles) {
       o.x = o.x - speed;
-      if (hit({ x: x, y: y, w: size, h: size }, o)) {
+
+      // near miss detection (grazing an obstacle within 18px without hitting it)
+      if (!o.nearMissed && o.x + o.w < x) {
+        o.nearMissed = true;
+        const distY = Math.abs((y + size / 2) - (o.y + o.h / 2));
+        if (distY < o.h / 2 + size / 2 + 20) {
+          score += 25;
+          addFloater("+25 Close Call", x + 40, y - 10, "#fbbf24");
+        }
+      }
+
+      if (hit(pBox, o)) {
         die();
       }
     }
-    obstacles = obstacles.filter(function (o) {
-      return o.x + o.w > 0;
-    });
+    obstacles = obstacles.filter(o => o.x + o.w > -50);
 
-    // trail history
-    trail.push({ x: x, y: y });
-    if (trail.length > 8) trail.shift();
+    // update collectible shards
+    for (let i = shards.length - 1; i >= 0; i--) {
+      const sh = shards[i];
+      sh.x -= speed;
+
+      // check pickup collision
+      const cx = x + size / 2;
+      const cy = y + size / 2;
+      const dist = Math.hypot(cx - sh.x, cy - sh.y);
+      if (dist < size / 2 + sh.size) {
+        score += 50;
+        playSound("collect");
+        addFloater("+50", sh.x, sh.y - 12, "#38bdf8");
+
+        // sparkle pickup particles
+        for (let k = 0; k < 10; k++) {
+          particles.push({
+            x: sh.x,
+            y: sh.y,
+            vx: (Math.random() - 0.5) * 4,
+            vy: (Math.random() - 0.5) * 4,
+            life: 18 + Math.random() * 8,
+            color: "#38bdf8",
+            size: 2.5
+          });
+        }
+        shards.splice(i, 1);
+        continue;
+      }
+
+      if (sh.x < -30) shards.splice(i, 1);
+    }
+
+    // player ghost trail history
+    trail.push({ x: x, y: y, scaleX: scaleX, scaleY: scaleY });
+    if (trail.length > 7) trail.shift();
   }
 
-  // draw obstacles (clean flat colors + subtle border)
+  // 4. Draw Obstacles (Clean flat color with subtle border)
   for (const o of obstacles) {
-    ctx.fillStyle = colorFor(o);
+    ctx.fillStyle = o.type === "gate" ? "#f59e0b" : "#f43f5e";
     ctx.fillRect(o.x, o.y, o.w, o.h);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+
+    // subtle top highlight
+    ctx.fillStyle = "rgba(255, 255, 255, 0.2)";
+    ctx.fillRect(o.x, o.y, o.w, 3);
+
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
     ctx.lineWidth = 1;
     ctx.strokeRect(o.x, o.y, o.w, o.h);
   }
 
-  // player trail
+  // 5. Draw Collectible Shards (Rotated Diamond with soft inner core)
+  for (const sh of shards) {
+    ctx.save();
+    ctx.translate(sh.x, sh.y);
+    ctx.rotate(frames * 0.04);
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillRect(-sh.size / 2, -sh.size / 2, sh.size, sh.size);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(-sh.size / 4, -sh.size / 4, sh.size / 2, sh.size / 2);
+    ctx.restore();
+  }
+
+  // 6. Draw Player Trail
   for (let i = 0; i < trail.length; i++) {
-    ctx.globalAlpha = ((i + 1) / trail.length) * 0.25;
+    const tr = trail[i];
+    ctx.save();
+    ctx.translate(tr.x + size / 2, tr.y + size / 2);
+    ctx.scale(tr.scaleX, tr.scaleY);
+    ctx.globalAlpha = ((i + 1) / trail.length) * 0.22;
     ctx.fillStyle = "#38bdf8";
-    ctx.fillRect(trail[i].x, trail[i].y, size, size);
+    ctx.fillRect(-size / 2, -size / 2, size, size);
+    ctx.restore();
   }
   ctx.globalAlpha = 1;
 
-  // draw player (solid, clean square - no up and down turning animation)
+  // 7. Draw Player (Clean solid box with tactile squash & stretch)
   if (state !== "over") {
+    ctx.save();
+    ctx.translate(x + size / 2, y + size / 2);
+    ctx.scale(scaleX, scaleY);
     ctx.fillStyle = "#38bdf8";
-    ctx.fillRect(x, y, size, size);
+    ctx.fillRect(-size / 2, -size / 2, size, size);
+
+    // subtle inner border for a crafted indie game look
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.35)";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(-size / 2 + 1, -size / 2 + 1, size - 2, size - 2);
+    ctx.restore();
   }
 
-  // death particles
-  for (const p of particles) {
-    p.x = p.x + p.vx;
-    p.y = p.y + p.vy;
-    p.life = p.life - 1;
-    ctx.globalAlpha = Math.max(p.life / 50, 0);
-    ctx.fillStyle = "#38bdf8";
-    ctx.fillRect(p.x, p.y, 3, 3);
+  // 8. Update & Draw Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life -= 1;
+    ctx.globalAlpha = Math.max(p.life / 30, 0);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.size || 2.5, p.size || 2.5);
+    if (p.life <= 0) particles.splice(i, 1);
   }
   ctx.globalAlpha = 1;
-  particles = particles.filter(function (p) {
-    return p.life > 0;
-  });
 
-  // HUD: score & best
+  // 9. Update & Draw Floating Text Popups
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const fl = floaters[i];
+    fl.y += fl.vy;
+    fl.life -= 1;
+    ctx.globalAlpha = Math.max(fl.life / 30, 0);
+    ctx.font = "bold 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+    ctx.fillStyle = fl.color;
+    ctx.textAlign = "left";
+    ctx.fillText(fl.text, fl.x, fl.y);
+    if (fl.life <= 0) floaters.splice(i, 1);
+  }
+  ctx.globalAlpha = 1;
+
+  // 10. HUD: Score, Best & Speed
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "600 16px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
   ctx.textAlign = "left";
   ctx.fillText("Score: " + Math.floor(score / 10), 20, 32);
 
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillStyle = newBestTriggered ? "#f59e0b" : "#94a3b8";
   ctx.font = "14px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
   ctx.fillText("Best: " + Math.floor(best / 10), 20, 54);
 
+  // Speed multiplier indicator
+  const speedX = (speed / 5.4).toFixed(1);
   ctx.textAlign = "right";
+  ctx.fillStyle = "#64748b";
+  ctx.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+  ctx.fillText("Speed " + speedX + "x", canvas.width - 20, 54);
+
+  ctx.fillStyle = "#94a3b8";
   ctx.fillText(muted ? "Sound: off (M)" : "Sound: on (M)", canvas.width - 20, 32);
 
-  // Overlay screens
+  // 11. Overlays: Start, Pause & Game Over
   ctx.textAlign = "center";
   if (state === "start") {
     ctx.fillStyle = "#ffffff";
@@ -347,7 +672,7 @@ function loop() {
 
     ctx.fillStyle = "#94a3b8";
     ctx.font = "16px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
-    ctx.fillText("Flip between floor & ceiling to dodge blocks", canvas.width / 2, 200);
+    ctx.fillText("Flip between floor & ceiling to dodge blocks and collect shards", canvas.width / 2, 200);
 
     ctx.fillStyle = "#38bdf8";
     ctx.font = "600 17px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
@@ -364,7 +689,7 @@ function loop() {
     ctx.font = "16px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     ctx.fillText("Press P to continue", canvas.width / 2, 220);
   } else if (state === "over") {
-    ctx.fillStyle = "rgba(10, 12, 18, 0.7)";
+    ctx.fillStyle = "rgba(10, 12, 18, 0.72)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     ctx.fillStyle = "#f43f5e";
@@ -379,7 +704,7 @@ function loop() {
     ctx.font = "15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
     if (score > 0 && Math.floor(score / 10) >= Math.floor(best / 10)) {
       ctx.fillStyle = "#f59e0b";
-      ctx.fillText("New Best Score!", canvas.width / 2, 225);
+      ctx.fillText("★ New Best Score! ★", canvas.width / 2, 225);
     } else {
       ctx.fillText("Best: " + Math.floor(best / 10), canvas.width / 2, 225);
     }
@@ -393,5 +718,5 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-// kick off loop
+// launch loop
 loop();
